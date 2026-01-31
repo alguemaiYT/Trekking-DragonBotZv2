@@ -29,10 +29,10 @@ camera:
 # Debug and Visualization Settings
 debug:
   # Show OpenCV windows (set to false for headless/server environments)
-  show_windows: false
+  show_windows: true
   
   # Show HSV mask window for color tuning
-  show_mask: false
+  show_mask: true
   
   # Print heading/steering debug info to terminal (HEADING_DBG messages)
   # When enabled, prints detected cone position, heading error in degrees, and estimated distance

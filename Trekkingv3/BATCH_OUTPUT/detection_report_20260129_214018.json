@@ -1,0 +1,73 @@
+{
+  "timestamp": "20260129_214018",
+  "config": {
+    "process_width": 960,
+    "process_height": 540,
+    "hfov_deg": 70.0,
+    "cone_height_m": 0.28
+  },
+  "summary": {
+    "total_images": 1,
+    "successful": 1,
+    "errors": 0,
+    "total_confirmed": 0,
+    "total_suspects": 2,
+    "total_rejected": 0
+  },
+  "results": [
+    {
+      "filename": "0_image1.png",
+      "status": "success",
+      "detections": [],
+      "suspects": [
+        {
+          "track_id": 0,
+          "state": "SUSPECT",
+          "bbox": [
+            431,
+            274,
+            132,
+            218
+          ],
+          "cx": 497.0,
+          "cy": 383.0,
+          "width": 132.0,
+          "height": 218.0,
+          "err_px": 17.0,
+          "err_deg": 1.4205878403104162,
+          "avg_score": 0.690453269913268,
+          "frames_seen": 3,
+          "reason": "Below confirmation threshold or lost updates"
+        },
+        {
+          "track_id": 1,
+          "state": "SUSPECT",
+          "bbox": [
+            19,
+            113,
+            271,
+            278
+          ],
+          "cx": 154.5,
+          "cy": 252.0,
+          "width": 271.0,
+          "height": 278.0,
+          "err_px": -325.5,
+          "err_deg": -25.399687953921482,
+          "avg_score": 0.4264867530190279,
+          "frames_seen": 3,
+          "reason": "Below confirmation threshold or lost updates"
+        }
+      ],
+      "rejects": [],
+      "output_image": "out_0_image1.png",
+      "stats": {
+        "confirmed_count": 0,
+        "suspect_count": 2,
+        "reject_count": 0,
+        "iterations": 3,
+        "processing_time_s": 1.046921968460083
+      }
+    }
+  ]
+}
