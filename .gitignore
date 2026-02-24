@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.coverage.*
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Generated artifacts
+versions/*/BATCH_OUTPUT/
+versions/*/DATASET/
+versions/v3/CNN/outputs/
+versions/v3/geracnn/dataset_aug/
+
+# Logs
+*.log

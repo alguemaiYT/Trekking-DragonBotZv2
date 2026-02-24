@@ -4,4 +4,6 @@ pyserial==3.5
 pytest==9.0.2
 PyYAML==6.0.3
 streamlit
-
+onnxruntime
+albumentations
+tqdm
