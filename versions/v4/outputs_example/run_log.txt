@@ -1,0 +1,10 @@
+0_080221MW-Wall-collapse_04jpeg.jpg: 2 cones
+0_Broxa-Lane-closure.jpg: 2 cones
+0_Cross-Street-road-closure.jpg: 2 cones
+0_JAJ_TEM_110220Roads_006JPG.jpg: 6 cones
+0_RM_150101_Roadworks_006.jpg: 3 cones
+0_Sefton-Coast-Column.jpg: 2 cones
+0_image1.png: 4 cones
+0_swindon-roadworks.jpg: 1 cones
+images.jpeg: 1 cones
+total=23
