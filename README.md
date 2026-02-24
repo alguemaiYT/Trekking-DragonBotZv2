@@ -1,6 +1,6 @@
 # Trekking-DragonBotZv2
 
-    Segunda versão do robô autônomo "Root", desenvolvido para navegação outdoor em terrenos irregulares. O projeto é focado na categoria Trekking Pro (Robocore) e utiliza ROS, fusão de sensores (GPS + IMU + encoder) e controle PID para percorrer waypoints de forma precisa e confiável.
+   Segunda versão do robô autônomo "Root", desenvolvido para navegação outdoor em terrenos irregulares. O projeto é focado na categoria Trekking Pro (Robocore) e utiliza ROS, fusão de sensores (GPS + IMU + encoder) e controle PID para percorrer waypoints de forma precisa e confiável.
 
 
 ## Estrutura atual
