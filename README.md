@@ -1,6 +1,7 @@
 # Trekking-DragonBotZv2
 
-Repositório organizado por versão. O diretório `versions/` concentra cada etapa da evolução do detector de cones, enquanto a raiz mantém dependências comuns e scripts de apoio.
+    Segunda versão do robô autônomo "Root", desenvolvido para navegação outdoor em terrenos irregulares. O projeto é focado na categoria Trekking Pro (Robocore) e utiliza ROS, fusão de sensores (GPS + IMU + encoder) e controle PID para percorrer waypoints de forma precisa e confiável.
+
 
 ## Estrutura atual
 ```text
