@@ -17,7 +17,7 @@
     └── v4/
 ```
 
-## Versões (links para os READMEs)
+## Versões
 - [v2-legacy](versions/v2-legacy/README.md): pipeline color tracker com `cone_tracker` modular, detecção HSV+CLAHE, `MultiConeTracker`, logs CSV/TXT, scripts de batch e exportação de CSV.
 - [v3](versions/v3/README.md): mantém o tracker da v2 e adiciona experimentos ONNX/CNN em `CNN/` e scripts de geração/validação em `geracnn/`.
 - [v4](versions/v4/README_cone_detector_v4.md): detector YOLO ONNX (`cone_detector_v4.py`), presets `fast/balanced/quality`, telemetria `--follow`, filtros HSV pré-inferência e geração automática de outputs.
