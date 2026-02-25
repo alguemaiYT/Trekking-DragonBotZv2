@@ -57,6 +57,11 @@ python3 v4/cone_detector_v4.py \
   --profile fast
 ```
 
+## GUI e front-end (planejamento)
+
+- Plano de GUI: `v4/GUI_PLAN.md`
+- Prompt pronto para gerar base front-end no Lovable: `v4/LOVABLE_PROMPT.md`
+
 Câmera:
 
 ```bash

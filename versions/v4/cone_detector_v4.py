@@ -124,6 +124,14 @@ PRESETS: Dict[str, RuntimePreset] = {
 }
 
 
+@dataclass
+class OverlayContext:
+    profile: str
+    runtime: RuntimePreset
+    use_roi: bool
+    roi_norm: Tuple[float, float, float, float]
+
+
 class ModelCatalog:
     def __init__(self, root: Path):
         self.root = root
@@ -734,6 +742,126 @@ class ConePipeline:
         return detections
 
 
+def _alpha_rect(
+    image: np.ndarray,
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    color: Tuple[int, int, int],
+    alpha: float,
+) -> None:
+    frame_h, frame_w = image.shape[:2]
+    x1 = int(clamp(x1, 0, frame_w - 1))
+    y1 = int(clamp(y1, 0, frame_h - 1))
+    x2 = int(clamp(x2, 0, frame_w - 1))
+    y2 = int(clamp(y2, 0, frame_h - 1))
+    if x2 <= x1 or y2 <= y1:
+        return
+
+    overlay = image.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
+    cv2.addWeighted(overlay, clamp(alpha, 0.0, 1.0), image, 1.0 - clamp(alpha, 0.0, 1.0), 0.0, dst=image)
+
+
+def _draw_panel(
+    image: np.ndarray,
+    x: int,
+    y: int,
+    lines: Sequence[str],
+    bg_color: Tuple[int, int, int] = (20, 20, 20),
+    fg_color: Tuple[int, int, int] = (240, 240, 240),
+    alpha: float = 0.55,
+) -> Tuple[int, int, int, int]:
+    if not lines:
+        return x, y, x, y
+
+    font = cv2.FONT_HERSHEY_DUPLEX
+    font_scale = 0.50
+    thickness = 1
+    pad = 8
+    line_gap = 6
+
+    text_sizes = [cv2.getTextSize(line, font, font_scale, thickness)[0] for line in lines]
+    max_w = max(w for w, _ in text_sizes)
+    max_h = max(h for _, h in text_sizes)
+    line_h = max_h + line_gap
+
+    panel_w = max_w + (2 * pad)
+    panel_h = (line_h * len(lines)) + (2 * pad) - line_gap
+    frame_h, frame_w = image.shape[:2]
+
+    x1 = int(clamp(x, 0, max(0, frame_w - panel_w - 1)))
+    y1 = int(clamp(y, 0, max(0, frame_h - panel_h - 1)))
+    x2 = min(frame_w - 1, x1 + panel_w)
+    y2 = min(frame_h - 1, y1 + panel_h)
+
+    _alpha_rect(image, x1, y1, x2, y2, bg_color, alpha)
+    cv2.rectangle(image, (x1, y1), (x2, y2), (120, 120, 120), 1, cv2.LINE_AA)
+
+    yy = y1 + pad + max_h
+    for line in lines:
+        cv2.putText(image, line, (x1 + pad, yy), font, font_scale, fg_color, thickness, cv2.LINE_AA)
+        yy += line_h
+
+    return x1, y1, x2, y2
+
+
+def _draw_signed_bar(
+    image: np.ndarray,
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    value: float,
+    max_value: float,
+    label: str,
+    neg_color: Tuple[int, int, int],
+    pos_color: Tuple[int, int, int],
+) -> None:
+    if w <= 8 or h <= 8:
+        return
+
+    _alpha_rect(image, x, y, x + w, y + h, (16, 16, 16), 0.50)
+    cv2.rectangle(image, (x, y), (x + w, y + h), (120, 120, 120), 1, cv2.LINE_AA)
+
+    center_x = x + (w // 2)
+    cv2.line(image, (center_x, y + 2), (center_x, y + h - 2), (150, 150, 150), 1, cv2.LINE_AA)
+
+    ratio = clamp(value / max(max_value, 1e-6), -1.0, 1.0)
+    half = max(1, (w // 2) - 3)
+    if ratio >= 0:
+        bx1 = center_x
+        bx2 = center_x + int(round(ratio * half))
+        color = pos_color
+    else:
+        bx1 = center_x + int(round(ratio * half))
+        bx2 = center_x
+        color = neg_color
+
+    if bx2 > bx1:
+        cv2.rectangle(image, (bx1, y + 2), (bx2, y + h - 2), color, -1)
+
+    cv2.putText(
+        image,
+        f"{label} {value:+.2f}",
+        (x + 6, y + h - 5),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.43,
+        (236, 236, 236),
+        1,
+        cv2.LINE_AA,
+    )
+
+
+def _detection_color(conf: float) -> Tuple[int, int, int]:
+    if conf >= 0.70:
+        return 60, 220, 70
+    if conf >= 0.45:
+        return 40, 200, 240
+    return 80, 150, 255
+
+
 def draw_overlay(
     frame: np.ndarray,
     detections: Sequence[Detection],
@@ -742,43 +870,136 @@ def draw_overlay(
     avg_infer_ms: float,
     show_orange_ratio: bool,
     follow_state: Optional[FollowState] = None,
+    avg_pipeline_ms: float = 0.0,
+    overlay_ctx: Optional[OverlayContext] = None,
+    frame_index: int = 0,
 ) -> np.ndarray:
     out = frame.copy()
-    for d in detections:
-        color = (20, 220, 20)
-        cv2.rectangle(out, (d.x1, d.y1), (d.x2, d.y2), color, 2)
-        lbl = f"cone {d.conf:.2f}"
+    frame_h, frame_w = out.shape[:2]
+    center_x, center_y = frame_w // 2, frame_h // 2
+
+    # Center reticle helps camera alignment and manual tuning.
+    cv2.circle(out, (center_x, center_y), 8, (210, 210, 210), 1, cv2.LINE_AA)
+    cv2.line(out, (center_x - 18, center_y), (center_x + 18, center_y), (140, 140, 140), 1, cv2.LINE_AA)
+    cv2.line(out, (center_x, center_y - 18), (center_x, center_y + 18), (140, 140, 140), 1, cv2.LINE_AA)
+
+    if overlay_ctx is not None and overlay_ctx.use_roi:
+        x1n, y1n, x2n, y2n = overlay_ctx.roi_norm
+        rx1 = int(clamp(round(x1n * frame_w), 0, frame_w - 1))
+        ry1 = int(clamp(round(y1n * frame_h), 0, frame_h - 1))
+        rx2 = int(clamp(round(x2n * frame_w), 1, frame_w - 1))
+        ry2 = int(clamp(round(y2n * frame_h), 1, frame_h - 1))
+        cv2.rectangle(out, (rx1, ry1), (rx2, ry2), (245, 210, 90), 2, cv2.LINE_AA)
+        _alpha_rect(out, rx1, max(0, ry1 - 24), min(frame_w - 1, rx1 + 120), ry1, (40, 60, 95), 0.65)
+        cv2.putText(out, "ROI active", (rx1 + 6, max(14, ry1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 240, 210), 1, cv2.LINE_AA)
+
+    for idx, d in enumerate(detections):
+        color = _detection_color(d.conf)
+        cv2.rectangle(out, (d.x1, d.y1), (d.x2, d.y2), color, 2, cv2.LINE_AA)
+
+        lbl = f"cone#{idx + 1} {d.conf:.2f}"
         if show_orange_ratio and d.orange_ratio >= 0:
             lbl += f" o:{d.orange_ratio:.2f}"
+
+        (tw, th), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_DUPLEX, 0.48, 1)
+        label_x1 = int(clamp(d.x1, 0, frame_w - 1))
+        label_y2 = d.y1 - 4
+        if label_y2 < (th + 8):
+            label_y2 = min(frame_h - 2, d.y1 + th + 10)
+        label_y1 = int(clamp(label_y2 - th - 10, 0, frame_h - 1))
+        label_x2 = int(clamp(label_x1 + tw + 12, 0, frame_w - 1))
+
+        _alpha_rect(out, label_x1, label_y1, label_x2, label_y2, color, 0.58)
         cv2.putText(
             out,
             lbl,
-            (d.x1, max(14, d.y1 - 6)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.50,
-            color,
+            (label_x1 + 6, label_y2 - 6),
+            cv2.FONT_HERSHEY_DUPLEX,
+            0.48,
+            (12, 12, 12),
             1,
             cv2.LINE_AA,
         )
 
-    top_lines = [
-        f"model: {model_tag}",
-        f"dets: {len(detections)} | infer_avg: {avg_infer_ms:.1f} ms",
-        f"status: {status}",
+    status_color = (70, 225, 110)
+    if "skip" in status:
+        status_color = (50, 205, 245)
+    elif "empty" in status:
+        status_color = (80, 155, 255)
+
+    info_lines = [
+        f"model {model_tag}",
+        f"frame {frame_index} | dets {len(detections)} | status {status}",
+        f"infer {avg_infer_ms:.1f} ms | pipeline {avg_pipeline_ms:.1f} ms",
     ]
-    if follow_state is not None:
-        top_lines.extend(
-            [
-                f"follow yaw={follow_state.heading_error_deg:+.2f} deg",
-                f"follow dist_err={follow_state.distance_error_ctrl:+.3f}",
-                f"cmd v={follow_state.v_cmd:+.2f} w={follow_state.w_cmd:+.2f}",
-                f"track_q={follow_state.tracking_quality:.2f} found={int(follow_state.found)}",
-            ]
+    if overlay_ctx is not None:
+        rt = overlay_ctx.runtime
+        info_lines.append(
+            f"profile {overlay_ctx.profile} | conf {rt.conf:.2f} | iou {rt.iou:.2f} | det_every {rt.det_every}"
         )
-    y = 20
-    for line in top_lines:
-        cv2.putText(out, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (40, 200, 255), 2, cv2.LINE_AA)
-        y += 20
+        info_lines.append(
+            f"prefilter {'on' if rt.prefilter_enabled else 'off'} | global {rt.prefilter_min_ratio:.4f} | box {rt.min_box_orange_ratio:.3f}"
+        )
+    _draw_panel(
+        out,
+        x=10,
+        y=10,
+        lines=info_lines,
+        bg_color=(22, 34, 48),
+        fg_color=status_color,
+        alpha=0.58,
+    )
+
+    if follow_state is not None:
+        if follow_state.target is not None:
+            tx = int((follow_state.target.x1 + follow_state.target.x2) * 0.5)
+            ty = int((follow_state.target.y1 + follow_state.target.y2) * 0.5)
+            cv2.line(out, (center_x, center_y), (tx, ty), (225, 225, 225), 1, cv2.LINE_AA)
+            cv2.circle(out, (tx, ty), 9, (255, 255, 255), 2, cv2.LINE_AA)
+
+        follow_lines = [
+            f"follow {follow_state.status} | q {follow_state.tracking_quality:.2f} | found {int(follow_state.found)}",
+            f"yaw {follow_state.heading_error_deg:+.2f} deg | dist_err {follow_state.distance_error_ctrl:+.3f}",
+            f"cmd v {follow_state.v_cmd:+.2f} | w {follow_state.w_cmd:+.2f} | err {follow_state.combined_error:.2f}",
+        ]
+        fx1, fy1, fx2, fy2 = _draw_panel(
+            out,
+            x=max(10, frame_w - 470),
+            y=10,
+            lines=follow_lines,
+            bg_color=(40, 36, 18),
+            fg_color=(255, 235, 165),
+            alpha=0.62,
+        )
+
+        bar_w = max(120, min(430, frame_w - fx1 - 14))
+        bar_h = 22
+        bar_x = fx1 + 6
+        bar_y = fy2 + 8
+        _draw_signed_bar(
+            out,
+            x=bar_x,
+            y=bar_y,
+            w=bar_w,
+            h=bar_h,
+            value=follow_state.heading_error_deg,
+            max_value=25.0,
+            label="yaw_deg",
+            neg_color=(80, 130, 255),
+            pos_color=(80, 230, 150),
+        )
+        _draw_signed_bar(
+            out,
+            x=bar_x,
+            y=bar_y + bar_h + 8,
+            w=bar_w,
+            h=bar_h,
+            value=follow_state.distance_error_ctrl,
+            max_value=1.0,
+            label="dist_err",
+            neg_color=(100, 185, 255),
+            pos_color=(120, 225, 150),
+        )
 
     return out
 
@@ -923,6 +1144,7 @@ def process_image_file(
     out_path: Path,
     pipeline: ConePipeline,
     model_tag: str,
+    overlay_ctx: OverlayContext,
     show: bool,
     show_orange_ratio: bool,
     follow_estimator: Optional[ConeFollowErrorEstimator] = None,
@@ -951,7 +1173,10 @@ def process_image_file(
         model_tag=model_tag,
         status=pipeline.stats.last_status,
         avg_infer_ms=pipeline.stats.avg_infer_ms,
+        avg_pipeline_ms=pipeline.stats.avg_pipeline_ms,
         show_orange_ratio=show_orange_ratio,
+        overlay_ctx=overlay_ctx,
+        frame_index=0,
         follow_state=follow_state,
     )
     ensure_parent(out_path)
@@ -979,6 +1204,7 @@ def process_image_dir(
     out_dir: Path,
     pipeline: ConePipeline,
     model_tag: str,
+    overlay_ctx: OverlayContext,
     show_orange_ratio: bool,
     follow_estimator: Optional[ConeFollowErrorEstimator] = None,
     follow_log_file=None,
@@ -1017,7 +1243,10 @@ def process_image_dir(
             model_tag=model_tag,
             status=pipeline.stats.last_status,
             avg_infer_ms=pipeline.stats.avg_infer_ms,
+            avg_pipeline_ms=pipeline.stats.avg_pipeline_ms,
             show_orange_ratio=show_orange_ratio,
+            overlay_ctx=overlay_ctx,
+            frame_index=idx,
             follow_state=follow_state,
         )
         out_path = out_dir / image_path.name
@@ -1041,6 +1270,7 @@ def process_video_or_camera(
     out_path: Optional[Path],
     pipeline: ConePipeline,
     model_tag: str,
+    overlay_ctx: OverlayContext,
     show: bool,
     show_orange_ratio: bool,
     camera_width: int,
@@ -1109,7 +1339,10 @@ def process_video_or_camera(
                 model_tag=model_tag,
                 status=pipeline.stats.last_status,
                 avg_infer_ms=pipeline.stats.avg_infer_ms,
+                avg_pipeline_ms=pipeline.stats.avg_pipeline_ms,
                 show_orange_ratio=show_orange_ratio,
+                overlay_ctx=overlay_ctx,
+                frame_index=frame_idx,
                 follow_state=follow_state,
             )
 
@@ -1205,6 +1438,12 @@ def main() -> None:
         roi_norm=roi_norm,
         hold_last_on_stride=True,
     )
+    overlay_ctx = OverlayContext(
+        profile=args.profile,
+        runtime=runtime,
+        use_roi=use_roi,
+        roi_norm=roi_norm,
+    )
 
     follow_enabled = bool(args.follow) or bool(args.follow_jsonl.strip())
     follow_estimator: Optional[ConeFollowErrorEstimator] = None
@@ -1284,6 +1523,7 @@ def main() -> None:
                 out_path=out_file,
                 pipeline=pipeline,
                 model_tag=model_tag,
+                overlay_ctx=overlay_ctx,
                 show=args.show,
                 show_orange_ratio=args.show_orange_ratio,
                 follow_estimator=follow_estimator,
@@ -1303,6 +1543,7 @@ def main() -> None:
                 out_dir=out_dir,
                 pipeline=pipeline,
                 model_tag=model_tag,
+                overlay_ctx=overlay_ctx,
                 show_orange_ratio=args.show_orange_ratio,
                 follow_estimator=follow_estimator,
                 follow_log_file=follow_log_file,
@@ -1323,6 +1564,7 @@ def main() -> None:
                 out_path=out_video,
                 pipeline=pipeline,
                 model_tag=model_tag,
+                overlay_ctx=overlay_ctx,
                 show=args.show,
                 show_orange_ratio=args.show_orange_ratio,
                 camera_width=args.camera_width,
