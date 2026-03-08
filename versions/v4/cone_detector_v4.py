@@ -8,15 +8,19 @@ Foco:
 - ter parâmetros úteis para hardware fraco
 - manter arquitetura simples para evolução futura
 """
-from __future__ import annotations
-
 import argparse
+import base64
 import json
 import math
+import tempfile
+import threading
 import time
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from urllib.parse import parse_qs, urlparse
+from uuid import uuid4
 
 import cv2
 import numpy as np
@@ -130,6 +134,82 @@ class OverlayContext:
     runtime: RuntimePreset
     use_roi: bool
     roi_norm: Tuple[float, float, float, float]
+
+
+@dataclass(frozen=True)
+class AppContext:
+    runtime: RuntimePreset
+    detector: Any
+    model_tag: str
+    overlay_ctx: OverlayContext
+    show_orange_ratio: bool
+    camera_width: int
+    camera_height: int
+    buffer_size: int
+    drop_grabs: int
+    follow_cfg: Optional[Any]
+    default_output_dir: Path
+
+    def create_pipeline(self) -> "ConePipeline":
+        return ConePipeline(
+            detector=self.detector,
+            orange_filter=OrangeMaskFilter(),
+            det_every=self.runtime.det_every,
+            prefilter_enabled=self.runtime.prefilter_enabled,
+            prefilter_min_ratio=self.runtime.prefilter_min_ratio,
+            min_box_orange_ratio=self.runtime.min_box_orange_ratio,
+            use_roi=self.overlay_ctx.use_roi,
+            roi_norm=self.overlay_ctx.roi_norm,
+            hold_last_on_stride=True,
+        )
+
+    def create_follow_estimator(self) -> Optional["ConeFollowErrorEstimator"]:
+        if self.follow_cfg is None:
+            return None
+        return ConeFollowErrorEstimator(cfg=self.follow_cfg)
+
+
+@dataclass
+class FrameProcessResult:
+    detections: List[Detection]
+    rendered: np.ndarray
+    follow_state: Optional[Any]
+    status: str
+    avg_infer_ms: float
+    avg_pipeline_ms: float
+
+
+@dataclass
+class VideoRunResult:
+    logs: List[str]
+    frame_count: int
+    elapsed_s: float
+    effective_fps: float
+    follow_summary: Optional[Dict[str, float]]
+
+
+@dataclass
+class StreamJobState:
+    stream_id: str
+    source: str
+    output_path: Optional[Path]
+    max_frames: Optional[int]
+    max_seconds: Optional[float]
+    started_at: float
+    running: bool = True
+    frames_processed: int = 0
+    last_timestamp_s: float = 0.0
+    last_status: str = "init"
+    last_detections: List[Dict[str, Any]] = None
+    last_follow: Optional[Dict[str, Any]] = None
+    latest_frame_jpeg: Optional[bytes] = None
+    summary: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+    ended_at: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        if self.last_detections is None:
+            self.last_detections = []
 
 
 class ModelCatalog:
@@ -271,6 +351,7 @@ class YoloOnnxDetector:
         self.conf_thres = conf_thres
         self.iou_thres = iou_thres
         self.max_det = max_det
+        self._infer_lock = threading.Lock()
 
         sess_opt = ort.SessionOptions()
         if threads >= 0:
@@ -334,7 +415,8 @@ class YoloOnnxDetector:
     def detect(self, frame: np.ndarray, offset_xy: Tuple[int, int] = (0, 0)) -> List[Detection]:
         frame_h, frame_w = frame.shape[:2]
         inp, ratio, (pad_w, pad_h) = self._preprocess(frame)
-        raw = self.session.run(None, {self.input_name: inp})[0]
+        with self._infer_lock:
+            raw = self.session.run(None, {self.input_name: inp})[0]
 
         if raw.ndim == 3:
             raw = raw[0]
@@ -650,6 +732,48 @@ def follow_state_to_record(frame_index: int, timestamp_s: float, state: FollowSt
         rec["target_bbox"] = [int(state.target.x1), int(state.target.y1), int(state.target.x2), int(state.target.y2)]
 
     return rec
+
+
+def detection_to_record(det: Detection) -> Dict[str, object]:
+    return {
+        "bbox": [int(det.x1), int(det.y1), int(det.x2), int(det.y2)],
+        "conf": float(det.conf),
+        "cls": int(det.cls),
+        "orange_ratio": float(det.orange_ratio),
+        "width": int(det.w),
+        "height": int(det.h),
+        "area": int(det.area),
+    }
+
+
+def pipeline_stats_to_record(pipeline: "ConePipeline") -> Dict[str, object]:
+    return {
+        "total_frames": int(pipeline.stats.total_frames),
+        "inferred_frames": int(pipeline.stats.inferred_frames),
+        "skipped_stride": int(pipeline.stats.skipped_stride),
+        "skipped_prefilter": int(pipeline.stats.skipped_prefilter),
+        "avg_infer_ms": float(pipeline.stats.avg_infer_ms),
+        "avg_pipeline_ms": float(pipeline.stats.avg_pipeline_ms),
+        "last_status": pipeline.stats.last_status,
+    }
+
+
+def encode_image(image: np.ndarray, ext: str = ".jpg", jpeg_quality: int = 90) -> bytes:
+    params: List[int] = []
+    if ext.lower() in {".jpg", ".jpeg"}:
+        params = [int(cv2.IMWRITE_JPEG_QUALITY), int(clamp(jpeg_quality, 1, 100))]
+    ok, buf = cv2.imencode(ext, image, params)
+    if not ok:
+        raise RuntimeError(f"Falha ao codificar imagem como {ext}")
+    return bytes(buf.tobytes())
+
+
+def decode_image_bytes(data: bytes) -> np.ndarray:
+    arr = np.frombuffer(data, dtype=np.uint8)
+    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if frame is None:
+        raise RuntimeError("Falha ao decodificar imagem enviada para a API.")
+    return frame
 
 
 class ConePipeline:
@@ -1033,8 +1157,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Detecção de cones em imagem/vídeo com modelos YOLO ONNX da v4 + OpenCV."
     )
-    p.add_argument("--source", required=True, help="Caminho da imagem/vídeo/pasta, ou índice da câmera (ex: 0).")
+    p.add_argument("--source", default="", help="Caminho da imagem/vídeo/pasta, ou índice da câmera (ex: 0).")
     p.add_argument("--output", default="", help="Arquivo de saída (imagem/vídeo) ou pasta de saída para diretório.")
+    p.add_argument("--api", default="", help="Inicia servidor HTTP no formato host:port (ex: localhost:9820).")
     p.add_argument("--model-root", default=str(DEFAULT_MODEL_ROOT), help="Raiz dos modelos (padrão: v4/yolov26n).")
     p.add_argument("--list-models", action="store_true", help="Lista os modelos detectados e sai.")
 
@@ -1139,6 +1264,122 @@ def write_txt_log(path: Path, lines: Iterable[str]) -> None:
             f.write(line.rstrip() + "\n")
 
 
+def run_frame_job(
+    frame: np.ndarray,
+    frame_index: int,
+    timestamp_s: float,
+    pipeline: ConePipeline,
+    model_tag: str,
+    overlay_ctx: OverlayContext,
+    show_orange_ratio: bool,
+    follow_estimator: Optional[ConeFollowErrorEstimator] = None,
+    follow_log_file=None,
+    follow_log_extra: Optional[Dict[str, object]] = None,
+) -> FrameProcessResult:
+    detections = pipeline.run(frame, frame_index=frame_index)
+    follow_state: Optional[FollowState] = None
+    if follow_estimator is not None:
+        follow_state = follow_estimator.update(
+            frame=frame,
+            detections=detections,
+            frame_index=frame_index,
+            timestamp_s=timestamp_s,
+        )
+        if follow_log_file is not None:
+            rec = follow_state_to_record(frame_index=frame_index, timestamp_s=timestamp_s, state=follow_state)
+            if follow_log_extra:
+                rec.update(follow_log_extra)
+            follow_log_file.write(json.dumps(rec, ensure_ascii=True) + "\n")
+
+    rendered = draw_overlay(
+        frame=frame,
+        detections=detections,
+        model_tag=model_tag,
+        status=pipeline.stats.last_status,
+        avg_infer_ms=pipeline.stats.avg_infer_ms,
+        avg_pipeline_ms=pipeline.stats.avg_pipeline_ms,
+        show_orange_ratio=show_orange_ratio,
+        overlay_ctx=overlay_ctx,
+        frame_index=frame_index,
+        follow_state=follow_state,
+    )
+    return FrameProcessResult(
+        detections=detections,
+        rendered=rendered,
+        follow_state=follow_state,
+        status=pipeline.stats.last_status,
+        avg_infer_ms=pipeline.stats.avg_infer_ms,
+        avg_pipeline_ms=pipeline.stats.avg_pipeline_ms,
+    )
+
+
+def open_capture_source(
+    source: str,
+    camera_width: int,
+    camera_height: int,
+    buffer_size: int,
+) -> Tuple[cv2.VideoCapture, bool, float]:
+    source_is_cam = False
+    cap_source: object = source
+
+    if source.isdigit() and not Path(source).exists():
+        source_is_cam = True
+        cap_source = int(source)
+
+    cap = cv2.VideoCapture(cap_source)
+    if not cap.isOpened():
+        raise RuntimeError(f"Falha ao abrir source: {source}")
+
+    if source_is_cam:
+        if camera_width > 0:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, camera_width)
+        if camera_height > 0:
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, camera_height)
+    if buffer_size > 0:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, buffer_size)
+
+    fps_in = cap.get(cv2.CAP_PROP_FPS)
+    if fps_in <= 0 or fps_in > 500:
+        fps_in = 30.0
+
+    return cap, source_is_cam, float(fps_in)
+
+
+def finalize_video_run(
+    start_t: float,
+    frame_count: int,
+    pipeline: ConePipeline,
+    follow_estimator: Optional[ConeFollowErrorEstimator],
+) -> VideoRunResult:
+    elapsed = time.perf_counter() - start_t
+    eff_fps = frame_count / elapsed if elapsed > 0 else 0.0
+
+    logs: List[str] = []
+    logs.append(f"frames={frame_count}")
+    logs.append(f"elapsed_s={elapsed:.2f}")
+    logs.append(f"effective_fps={eff_fps:.2f}")
+    logs.append(f"inferred_frames={pipeline.stats.inferred_frames}")
+    logs.append(f"skip_stride={pipeline.stats.skipped_stride}")
+    logs.append(f"skip_prefilter={pipeline.stats.skipped_prefilter}")
+    logs.append(f"avg_infer_ms={pipeline.stats.avg_infer_ms:.2f}")
+    logs.append(f"avg_pipeline_ms={pipeline.stats.avg_pipeline_ms:.2f}")
+
+    follow_summary = None
+    if follow_estimator is not None:
+        follow_summary = follow_estimator.summary()
+        logs.append(f"follow_found_ratio={follow_summary['found_ratio']:.3f}")
+        logs.append(f"follow_mean_abs_heading_deg={follow_summary['mean_abs_heading_deg']:.3f}")
+        logs.append(f"follow_mean_abs_distance_error={follow_summary['mean_abs_distance_error_ctrl']:.3f}")
+
+    return VideoRunResult(
+        logs=logs,
+        frame_count=frame_count,
+        elapsed_s=float(elapsed),
+        effective_fps=float(eff_fps),
+        follow_summary=follow_summary,
+    )
+
+
 def process_image_file(
     image_path: Path,
     out_path: Path,
@@ -1154,49 +1395,35 @@ def process_image_file(
     if frame is None:
         raise RuntimeError(f"Falha ao abrir imagem: {image_path}")
 
-    detections = pipeline.run(frame, frame_index=0)
-    follow_state: Optional[FollowState] = None
-    if follow_estimator is not None:
-        follow_state = follow_estimator.update(
-            frame=frame,
-            detections=detections,
-            frame_index=0,
-            timestamp_s=0.0,
-        )
-        if follow_log_file is not None:
-            rec = follow_state_to_record(frame_index=0, timestamp_s=0.0, state=follow_state)
-            follow_log_file.write(json.dumps(rec, ensure_ascii=True) + "\n")
-
-    rendered = draw_overlay(
+    result = run_frame_job(
         frame=frame,
-        detections=detections,
-        model_tag=model_tag,
-        status=pipeline.stats.last_status,
-        avg_infer_ms=pipeline.stats.avg_infer_ms,
-        avg_pipeline_ms=pipeline.stats.avg_pipeline_ms,
-        show_orange_ratio=show_orange_ratio,
-        overlay_ctx=overlay_ctx,
         frame_index=0,
-        follow_state=follow_state,
+        timestamp_s=0.0,
+        pipeline=pipeline,
+        model_tag=model_tag,
+        overlay_ctx=overlay_ctx,
+        show_orange_ratio=show_orange_ratio,
+        follow_estimator=follow_estimator,
+        follow_log_file=follow_log_file,
     )
     ensure_parent(out_path)
-    cv2.imwrite(str(out_path), rendered)
+    cv2.imwrite(str(out_path), result.rendered)
 
     if show:
-        cv2.imshow("cone_detector_v4", rendered)
+        cv2.imshow("cone_detector_v4", result.rendered)
         cv2.waitKey(0)
         cv2.destroyAllWindows()
 
-    msg = f"{image_path.name}: {len(detections)} cones"
-    if follow_state is not None:
+    msg = f"{image_path.name}: {len(result.detections)} cones"
+    if result.follow_state is not None:
         msg += (
             " | "
-            f"yaw={follow_state.heading_error_deg:+.2f}deg "
-            f"dist_err={follow_state.distance_error_ctrl:+.3f} "
-            f"v={follow_state.v_cmd:+.2f} "
-            f"w={follow_state.w_cmd:+.2f}"
+            f"yaw={result.follow_state.heading_error_deg:+.2f}deg "
+            f"dist_err={result.follow_state.distance_error_ctrl:+.3f} "
+            f"v={result.follow_state.v_cmd:+.2f} "
+            f"w={result.follow_state.w_cmd:+.2f}"
         )
-    return len(detections), msg
+    return len(result.detections), msg
 
 
 def process_image_dir(
@@ -1222,43 +1449,29 @@ def process_image_dir(
         if frame is None:
             logs.append(f"{image_path.name}: erro ao abrir")
             continue
-        detections = pipeline.run(frame, frame_index=idx)
-        follow_state: Optional[FollowState] = None
-        if follow_estimator is not None:
-            follow_state = follow_estimator.update(
-                frame=frame,
-                detections=detections,
-                frame_index=idx,
-                timestamp_s=float(idx),
-            )
-            if follow_log_file is not None:
-                rec = follow_state_to_record(frame_index=idx, timestamp_s=float(idx), state=follow_state)
-                rec["image_name"] = image_path.name
-                follow_log_file.write(json.dumps(rec, ensure_ascii=True) + "\n")
-
-        total += len(detections)
-        rendered = draw_overlay(
+        result = run_frame_job(
             frame=frame,
-            detections=detections,
-            model_tag=model_tag,
-            status=pipeline.stats.last_status,
-            avg_infer_ms=pipeline.stats.avg_infer_ms,
-            avg_pipeline_ms=pipeline.stats.avg_pipeline_ms,
-            show_orange_ratio=show_orange_ratio,
-            overlay_ctx=overlay_ctx,
             frame_index=idx,
-            follow_state=follow_state,
+            timestamp_s=float(idx),
+            pipeline=pipeline,
+            model_tag=model_tag,
+            overlay_ctx=overlay_ctx,
+            show_orange_ratio=show_orange_ratio,
+            follow_estimator=follow_estimator,
+            follow_log_file=follow_log_file,
+            follow_log_extra={"image_name": image_path.name},
         )
+        total += len(result.detections)
         out_path = out_dir / image_path.name
-        cv2.imwrite(str(out_path), rendered)
-        msg = f"{image_path.name}: {len(detections)} cones"
-        if follow_state is not None:
+        cv2.imwrite(str(out_path), result.rendered)
+        msg = f"{image_path.name}: {len(result.detections)} cones"
+        if result.follow_state is not None:
             msg += (
                 " | "
-                f"yaw={follow_state.heading_error_deg:+.2f}deg "
-                f"dist_err={follow_state.distance_error_ctrl:+.3f} "
-                f"v={follow_state.v_cmd:+.2f} "
-                f"w={follow_state.w_cmd:+.2f}"
+                f"yaw={result.follow_state.heading_error_deg:+.2f}deg "
+                f"dist_err={result.follow_state.distance_error_ctrl:+.3f} "
+                f"v={result.follow_state.v_cmd:+.2f} "
+                f"w={result.follow_state.w_cmd:+.2f}"
             )
         logs.append(msg)
 
@@ -1279,31 +1492,14 @@ def process_video_or_camera(
     drop_grabs: int,
     follow_estimator: Optional[ConeFollowErrorEstimator] = None,
     follow_log_file=None,
-) -> List[str]:
-    logs: List[str] = []
-    source_is_cam = False
-    cap_source: object = source
-
-    if source.isdigit() and not Path(source).exists():
-        source_is_cam = True
-        cap_source = int(source)
-
-    cap = cv2.VideoCapture(cap_source)
-    if not cap.isOpened():
-        raise RuntimeError(f"Falha ao abrir source: {source}")
-
-    if source_is_cam:
-        if camera_width > 0:
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, camera_width)
-        if camera_height > 0:
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, camera_height)
-    if buffer_size > 0:
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, buffer_size)
-
-    fps_in = cap.get(cv2.CAP_PROP_FPS)
-    if fps_in <= 0 or fps_in > 500:
-        fps_in = 30.0
-
+    max_frames: Optional[int] = None,
+) -> VideoRunResult:
+    cap, _source_is_cam, fps_in = open_capture_source(
+        source=source,
+        camera_width=camera_width,
+        camera_height=camera_height,
+        buffer_size=buffer_size,
+    )
     writer = None
     frame_idx = 0
     start_t = time.perf_counter()
@@ -1311,6 +1507,8 @@ def process_video_or_camera(
 
     try:
         while True:
+            if max_frames is not None and frame_count >= max_frames:
+                break
             for _ in range(max(0, drop_grabs)):
                 if not cap.grab():
                     break
@@ -1319,43 +1517,29 @@ def process_video_or_camera(
             if not ok or frame is None:
                 break
 
-            detections = pipeline.run(frame, frame_index=frame_idx)
             timestamp_s = frame_idx / max(1e-6, fps_in)
-            follow_state: Optional[FollowState] = None
-            if follow_estimator is not None:
-                follow_state = follow_estimator.update(
-                    frame=frame,
-                    detections=detections,
-                    frame_index=frame_idx,
-                    timestamp_s=timestamp_s,
-                )
-                if follow_log_file is not None:
-                    rec = follow_state_to_record(frame_index=frame_idx, timestamp_s=timestamp_s, state=follow_state)
-                    follow_log_file.write(json.dumps(rec, ensure_ascii=True) + "\n")
-
-            rendered = draw_overlay(
+            result = run_frame_job(
                 frame=frame,
-                detections=detections,
-                model_tag=model_tag,
-                status=pipeline.stats.last_status,
-                avg_infer_ms=pipeline.stats.avg_infer_ms,
-                avg_pipeline_ms=pipeline.stats.avg_pipeline_ms,
-                show_orange_ratio=show_orange_ratio,
-                overlay_ctx=overlay_ctx,
                 frame_index=frame_idx,
-                follow_state=follow_state,
+                timestamp_s=timestamp_s,
+                pipeline=pipeline,
+                model_tag=model_tag,
+                overlay_ctx=overlay_ctx,
+                show_orange_ratio=show_orange_ratio,
+                follow_estimator=follow_estimator,
+                follow_log_file=follow_log_file,
             )
 
             if out_path is not None:
                 if writer is None:
                     ensure_parent(out_path)
-                    h, w = rendered.shape[:2]
+                    h, w = result.rendered.shape[:2]
                     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
                     writer = cv2.VideoWriter(str(out_path), fourcc, fps_in, (w, h))
-                writer.write(rendered)
+                writer.write(result.rendered)
 
             if show:
-                cv2.imshow("cone_detector_v4", rendered)
+                cv2.imshow("cone_detector_v4", result.rendered)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
 
@@ -1368,22 +1552,710 @@ def process_video_or_camera(
         if show:
             cv2.destroyAllWindows()
 
-    elapsed = time.perf_counter() - start_t
-    eff_fps = frame_count / elapsed if elapsed > 0 else 0.0
-    logs.append(f"frames={frame_count}")
-    logs.append(f"elapsed_s={elapsed:.2f}")
-    logs.append(f"effective_fps={eff_fps:.2f}")
-    logs.append(f"inferred_frames={pipeline.stats.inferred_frames}")
-    logs.append(f"skip_stride={pipeline.stats.skipped_stride}")
-    logs.append(f"skip_prefilter={pipeline.stats.skipped_prefilter}")
-    logs.append(f"avg_infer_ms={pipeline.stats.avg_infer_ms:.2f}")
-    logs.append(f"avg_pipeline_ms={pipeline.stats.avg_pipeline_ms:.2f}")
-    if follow_estimator is not None:
-        fs = follow_estimator.summary()
-        logs.append(f"follow_found_ratio={fs['found_ratio']:.3f}")
-        logs.append(f"follow_mean_abs_heading_deg={fs['mean_abs_heading_deg']:.3f}")
-        logs.append(f"follow_mean_abs_distance_error={fs['mean_abs_distance_error_ctrl']:.3f}")
-    return logs
+    return finalize_video_run(
+        start_t=start_t,
+        frame_count=frame_count,
+        pipeline=pipeline,
+        follow_estimator=follow_estimator,
+    )
+
+
+def video_run_result_to_record(
+    result: VideoRunResult,
+    pipeline: ConePipeline,
+    output_path: Optional[Path] = None,
+) -> Dict[str, object]:
+    rec: Dict[str, object] = {
+        "frames": int(result.frame_count),
+        "elapsed_s": float(result.elapsed_s),
+        "effective_fps": float(result.effective_fps),
+        "logs": list(result.logs),
+        "pipeline": pipeline_stats_to_record(pipeline),
+    }
+    if output_path is not None:
+        rec["output_video"] = str(output_path)
+    if result.follow_summary is not None:
+        rec["follow_summary"] = result.follow_summary
+    return rec
+
+
+def parse_api_bind(bind_addr: str) -> Tuple[str, int]:
+    if ":" not in bind_addr:
+        raise ValueError("Use --api no formato host:port, por exemplo localhost:9820")
+    host, port_text = bind_addr.rsplit(":", 1)
+    host = host.strip() or "0.0.0.0"
+    try:
+        port = int(port_text)
+    except ValueError as exc:
+        raise ValueError(f"Porta inválida em --api: {port_text}") from exc
+    if port < 0 or port > 65535:
+        raise ValueError(f"Porta fora do intervalo válido: {port}")
+    return host, port
+
+
+def resolve_client_filesystem_path(path_text: str, client_cwd: Optional[str] = None) -> Path:
+    path = Path(path_text).expanduser()
+    if path.is_absolute():
+        return path.resolve()
+    if client_cwd:
+        return (Path(client_cwd).expanduser() / path).resolve()
+    return path
+
+
+def resolve_client_source_ref(source_text: str, client_cwd: Optional[str] = None) -> str:
+    source_text = str(source_text).strip()
+    if not source_text:
+        return source_text
+    if source_text.isdigit():
+        return source_text
+    if "://" in source_text:
+        return source_text
+    return str(resolve_client_filesystem_path(source_text, client_cwd=client_cwd))
+
+
+def normalize_image_output_format(output_format: Optional[str]) -> str:
+    fmt = (output_format or "jpg").strip().lower().lstrip(".")
+    if fmt == "jpeg":
+        fmt = "jpg"
+    ext = f".{fmt}"
+    if ext not in IMAGE_EXTS:
+        raise ValueError(f"Formato de imagem inválido para output: {output_format}")
+    return ext
+
+
+def resolve_requested_image_output(
+    requested: Optional[str],
+    client_cwd: Optional[str] = None,
+    output_format: Optional[str] = None,
+) -> Optional[Path]:
+    if not requested:
+        return None
+    output_path = resolve_client_filesystem_path(str(requested), client_cwd=client_cwd)
+    if output_path.suffix:
+        return output_path
+    return output_path.with_suffix(normalize_image_output_format(output_format))
+
+
+class ApiStreamWorker:
+    def __init__(
+        self,
+        app_ctx: AppContext,
+        stream_id: str,
+        source: str,
+        output_path: Optional[Path],
+        max_frames: Optional[int],
+        max_seconds: Optional[float],
+    ):
+        self.app_ctx = app_ctx
+        self.state = StreamJobState(
+            stream_id=stream_id,
+            source=source,
+            output_path=output_path,
+            max_frames=max_frames,
+            max_seconds=max_seconds,
+            started_at=time.time(),
+        )
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True, name=f"v4-stream-{stream_id[:8]}")
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self, join_timeout: float = 5.0) -> Dict[str, object]:
+        self._stop_event.set()
+        self._thread.join(timeout=join_timeout)
+        payload = self.snapshot()
+        payload["stopped"] = True
+        return payload
+
+    def latest_frame(self) -> bytes:
+        with self._lock:
+            if self.state.latest_frame_jpeg is None:
+                raise RuntimeError(f"Stream '{self.state.stream_id}' ainda não produziu frame renderizado.")
+            return self.state.latest_frame_jpeg
+
+    def snapshot(self) -> Dict[str, object]:
+        with self._lock:
+            payload: Dict[str, object] = {
+                "ok": self.state.error is None,
+                "stream_id": self.state.stream_id,
+                "source": self.state.source,
+                "running": bool(self.state.running),
+                "frames_processed": int(self.state.frames_processed),
+                "last_timestamp_s": float(self.state.last_timestamp_s),
+                "last_status": self.state.last_status,
+                "last_detections": list(self.state.last_detections),
+                "output_video": (str(self.state.output_path) if self.state.output_path is not None else ""),
+                "started_at": float(self.state.started_at),
+                "ended_at": (float(self.state.ended_at) if self.state.ended_at is not None else None),
+                "max_frames": self.state.max_frames,
+                "max_seconds": self.state.max_seconds,
+            }
+            if self.state.last_follow is not None:
+                payload["last_follow"] = self.state.last_follow
+            if self.state.summary is not None:
+                payload["summary"] = self.state.summary
+            if self.state.error is not None:
+                payload["error"] = self.state.error
+            return payload
+
+    def _run(self) -> None:
+        pipeline = self.app_ctx.create_pipeline()
+        follow_estimator = self.app_ctx.create_follow_estimator()
+        writer = None
+        cap = None
+        frame_idx = 0
+        start_t = time.perf_counter()
+
+        try:
+            cap, _source_is_cam, fps_in = open_capture_source(
+                source=self.state.source,
+                camera_width=self.app_ctx.camera_width,
+                camera_height=self.app_ctx.camera_height,
+                buffer_size=self.app_ctx.buffer_size,
+            )
+
+            while not self._stop_event.is_set():
+                if self.state.max_frames is not None and frame_idx >= self.state.max_frames:
+                    break
+                if self.state.max_seconds is not None and (time.perf_counter() - start_t) >= self.state.max_seconds:
+                    break
+
+                for _ in range(max(0, self.app_ctx.drop_grabs)):
+                    if not cap.grab():
+                        break
+
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    break
+
+                timestamp_s = frame_idx / max(1e-6, fps_in)
+                result = run_frame_job(
+                    frame=frame,
+                    frame_index=frame_idx,
+                    timestamp_s=timestamp_s,
+                    pipeline=pipeline,
+                    model_tag=self.app_ctx.model_tag,
+                    overlay_ctx=self.app_ctx.overlay_ctx,
+                    show_orange_ratio=self.app_ctx.show_orange_ratio,
+                    follow_estimator=follow_estimator,
+                )
+
+                if self.state.output_path is not None:
+                    if writer is None:
+                        ensure_parent(self.state.output_path)
+                        h, w = result.rendered.shape[:2]
+                        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                        writer = cv2.VideoWriter(str(self.state.output_path), fourcc, fps_in, (w, h))
+                    writer.write(result.rendered)
+
+                follow_payload = (
+                    follow_state_to_record(frame_index=frame_idx, timestamp_s=timestamp_s, state=result.follow_state)
+                    if result.follow_state is not None
+                    else None
+                )
+
+                with self._lock:
+                    self.state.frames_processed = frame_idx + 1
+                    self.state.last_timestamp_s = float(timestamp_s)
+                    self.state.last_status = result.status
+                    self.state.last_detections = [detection_to_record(det) for det in result.detections]
+                    self.state.last_follow = follow_payload
+                    self.state.latest_frame_jpeg = encode_image(result.rendered, ext=".jpg", jpeg_quality=85)
+
+                frame_idx += 1
+
+            summary = finalize_video_run(
+                start_t=start_t,
+                frame_count=frame_idx,
+                pipeline=pipeline,
+                follow_estimator=follow_estimator,
+            )
+            with self._lock:
+                self.state.running = False
+                self.state.ended_at = time.time()
+                self.state.summary = video_run_result_to_record(
+                    result=summary,
+                    pipeline=pipeline,
+                    output_path=self.state.output_path,
+                )
+        except Exception as exc:
+            with self._lock:
+                self.state.running = False
+                self.state.ended_at = time.time()
+                self.state.error = str(exc)
+                self.state.summary = {
+                    "frames": int(frame_idx),
+                    "pipeline": pipeline_stats_to_record(pipeline),
+                }
+        finally:
+            if cap is not None:
+                cap.release()
+            if writer is not None:
+                writer.release()
+
+
+class ConeApiService:
+    def __init__(self, app_ctx: AppContext):
+        self.app_ctx = app_ctx
+        self._streams: Dict[str, ApiStreamWorker] = {}
+        self._streams_lock = threading.Lock()
+
+    @staticmethod
+    def _as_bool(value: Any, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        return str(value).strip().lower() in {"1", "true", "yes", "on", "y", "sim"}
+
+    def _query_value(self, query: Optional[Dict[str, List[str]]], key: str) -> Optional[str]:
+        if not query:
+            return None
+        values = query.get(key)
+        if not values:
+            return None
+        return values[0]
+
+    def _client_cwd(self, body: Optional[Dict[str, Any]], headers: Optional[Dict[str, str]]) -> Optional[str]:
+        body = body or {}
+        headers = headers or {}
+        return (
+            body.get("client_cwd")
+            or body.get("cwd")
+            or headers.get("X-Client-Cwd")
+            or headers.get("X-Cwd")
+        )
+
+    def _resolve_output_path(
+        self,
+        requested: Optional[str],
+        stem: str,
+        suffix: str,
+        body: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> Path:
+        if requested:
+            return resolve_client_filesystem_path(str(requested), client_cwd=self._client_cwd(body, headers))
+        self.app_ctx.default_output_dir.mkdir(parents=True, exist_ok=True)
+        return (self.app_ctx.default_output_dir / f"{stem}_{uuid4().hex}{suffix}").resolve()
+
+    def _build_image_payload(
+        self,
+        frame: np.ndarray,
+        source_label: str,
+        return_image: bool,
+        output_path: Optional[Path] = None,
+        return_image_ext: str = ".jpg",
+    ) -> Dict[str, object]:
+        pipeline = self.app_ctx.create_pipeline()
+        follow_estimator = self.app_ctx.create_follow_estimator()
+        result = run_frame_job(
+            frame=frame,
+            frame_index=0,
+            timestamp_s=0.0,
+            pipeline=pipeline,
+            model_tag=self.app_ctx.model_tag,
+            overlay_ctx=self.app_ctx.overlay_ctx,
+            show_orange_ratio=self.app_ctx.show_orange_ratio,
+            follow_estimator=follow_estimator,
+        )
+
+        payload: Dict[str, object] = {
+            "ok": True,
+            "kind": "image",
+            "source": source_label,
+            "model": self.app_ctx.model_tag,
+            "count": len(result.detections),
+            "status": result.status,
+            "detections": [detection_to_record(det) for det in result.detections],
+            "pipeline": pipeline_stats_to_record(pipeline),
+            "image_shape": {
+                "height": int(frame.shape[0]),
+                "width": int(frame.shape[1]),
+            },
+        }
+        if result.follow_state is not None:
+            payload["follow"] = follow_state_to_record(frame_index=0, timestamp_s=0.0, state=result.follow_state)
+        rendered_output_ext = (
+            normalize_image_output_format(output_path.suffix)
+            if output_path is not None and output_path.suffix
+            else normalize_image_output_format(return_image_ext)
+        )
+        rendered_output_bytes: Optional[bytes] = None
+        if output_path is not None:
+            rendered_output_bytes = encode_image(result.rendered, ext=rendered_output_ext, jpeg_quality=90)
+            ensure_parent(output_path)
+            with output_path.open("wb") as f:
+                f.write(rendered_output_bytes)
+            payload["output_image"] = str(output_path)
+            payload["output_image_format"] = rendered_output_ext.lstrip(".")
+        if return_image:
+            if rendered_output_bytes is None or rendered_output_ext != normalize_image_output_format(return_image_ext):
+                rendered_output_bytes = encode_image(
+                    result.rendered,
+                    ext=normalize_image_output_format(return_image_ext),
+                    jpeg_quality=90,
+                )
+            payload["rendered_image_base64"] = base64.b64encode(
+                rendered_output_bytes
+            ).decode("ascii")
+            payload["rendered_image_format"] = normalize_image_output_format(return_image_ext).lstrip(".")
+        return payload
+
+    def detect_image(
+        self,
+        *,
+        image_bytes: Optional[bytes] = None,
+        source: Optional[str] = None,
+        body: Optional[Dict[str, Any]] = None,
+        query: Optional[Dict[str, List[str]]] = None,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, object]:
+        headers = headers or {}
+        body = body or {}
+        client_cwd = self._client_cwd(body, headers)
+        return_image = self._as_bool(
+            body.get("return_image", self._query_value(query, "return_image")),
+            default=True,
+        )
+        output_path = resolve_requested_image_output(
+            body.get("output", self._query_value(query, "output")),
+            client_cwd=client_cwd,
+            output_format=body.get("output_format", self._query_value(query, "output_format")),
+        )
+        return_image_ext = normalize_image_output_format(
+            body.get("output_format", self._query_value(query, "output_format"))
+        )
+
+        if source is None:
+            source = body.get("source")
+
+        if source:
+            image_path = Path(resolve_client_source_ref(str(source), client_cwd=client_cwd))
+            frame = cv2.imread(str(image_path))
+            if frame is None:
+                raise RuntimeError(f"Falha ao abrir imagem: {image_path}")
+            return self._build_image_payload(
+                frame=frame,
+                source_label=str(image_path),
+                return_image=return_image,
+                output_path=output_path,
+                return_image_ext=return_image_ext,
+            )
+
+        if image_bytes is None and body.get("image_b64"):
+            image_bytes = base64.b64decode(str(body["image_b64"]))
+
+        if image_bytes is None:
+            raise ValueError("Envie bytes da imagem ou um campo 'source' para /detect/image")
+
+        frame = decode_image_bytes(image_bytes)
+        source_label = headers.get("X-Filename") or str(body.get("filename") or "upload_image")
+        return self._build_image_payload(
+            frame=frame,
+            source_label=source_label,
+            return_image=return_image,
+            output_path=output_path,
+            return_image_ext=return_image_ext,
+        )
+
+    def detect_video(
+        self,
+        *,
+        video_bytes: Optional[bytes] = None,
+        source: Optional[str] = None,
+        body: Optional[Dict[str, Any]] = None,
+        query: Optional[Dict[str, List[str]]] = None,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, object]:
+        del query
+        headers = headers or {}
+        body = body or {}
+
+        if source is None:
+            source = body.get("source")
+
+        max_frames = body.get("max_frames")
+        max_frames = int(max_frames) if max_frames is not None else None
+        output_path = self._resolve_output_path(
+            body.get("output"),
+            stem="api_video",
+            suffix=".mp4",
+            body=body,
+            headers=headers,
+        )
+
+        temp_input_path: Optional[Path] = None
+        try:
+            if source:
+                source_label = resolve_client_source_ref(str(source), client_cwd=self._client_cwd(body, headers))
+            else:
+                if video_bytes is None and body.get("video_b64"):
+                    video_bytes = base64.b64decode(str(body["video_b64"]))
+                if video_bytes is None:
+                    raise ValueError("Envie bytes do vídeo ou um campo 'source' para /detect/video")
+                filename_hint = headers.get("X-Filename") or str(body.get("filename") or "upload.mp4")
+                suffix = Path(filename_hint).suffix or ".mp4"
+                with tempfile.NamedTemporaryFile(prefix="cone_api_in_", suffix=suffix, delete=False) as tmp:
+                    tmp.write(video_bytes)
+                    temp_input_path = Path(tmp.name)
+                source_label = str(temp_input_path)
+
+            pipeline = self.app_ctx.create_pipeline()
+            follow_estimator = self.app_ctx.create_follow_estimator()
+            result = process_video_or_camera(
+                source=source_label,
+                out_path=output_path,
+                pipeline=pipeline,
+                model_tag=self.app_ctx.model_tag,
+                overlay_ctx=self.app_ctx.overlay_ctx,
+                show=False,
+                show_orange_ratio=self.app_ctx.show_orange_ratio,
+                camera_width=self.app_ctx.camera_width,
+                camera_height=self.app_ctx.camera_height,
+                buffer_size=max(0, self.app_ctx.buffer_size),
+                drop_grabs=max(0, self.app_ctx.drop_grabs),
+                follow_estimator=follow_estimator,
+                follow_log_file=None,
+                max_frames=max_frames,
+            )
+            payload = video_run_result_to_record(result=result, pipeline=pipeline, output_path=output_path)
+            payload.update(
+                {
+                    "ok": True,
+                    "kind": "video",
+                    "source": source_label,
+                    "model": self.app_ctx.model_tag,
+                    "output_video": str(output_path),
+                }
+            )
+            return payload
+        finally:
+            if temp_input_path is not None and temp_input_path.exists():
+                temp_input_path.unlink()
+
+    def start_stream(
+        self,
+        *,
+        source: str,
+        body: Optional[Dict[str, Any]] = None,
+        query: Optional[Dict[str, List[str]]] = None,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, object]:
+        del query
+        headers = headers or {}
+        body = body or {}
+        source = str(source).strip()
+        if not source:
+            raise ValueError("Campo 'source' é obrigatório para iniciar um stream.")
+
+        record = self._as_bool(body.get("record"), default=False) or bool(body.get("output"))
+        output_path = (
+            self._resolve_output_path(
+                body.get("output"),
+                stem="api_stream",
+                suffix=".mp4",
+                body=body,
+                headers=headers,
+            )
+            if record
+            else None
+        )
+        max_frames = body.get("max_frames")
+        max_frames = int(max_frames) if max_frames is not None else None
+        max_seconds = body.get("max_seconds")
+        max_seconds = float(max_seconds) if max_seconds is not None else None
+        source = resolve_client_source_ref(source, client_cwd=self._client_cwd(body, headers))
+
+        stream_id = f"stream-{uuid4().hex[:12]}"
+        worker = ApiStreamWorker(
+            app_ctx=self.app_ctx,
+            stream_id=stream_id,
+            source=source,
+            output_path=output_path,
+            max_frames=max_frames,
+            max_seconds=max_seconds,
+        )
+        with self._streams_lock:
+            self._streams[stream_id] = worker
+        worker.start()
+        return worker.snapshot()
+
+    def get_stream_status(self, stream_id: str) -> Dict[str, object]:
+        with self._streams_lock:
+            worker = self._streams.get(stream_id)
+        if worker is None:
+            raise KeyError(stream_id)
+        return worker.snapshot()
+
+    def get_stream_frame(self, stream_id: str) -> bytes:
+        with self._streams_lock:
+            worker = self._streams.get(stream_id)
+        if worker is None:
+            raise KeyError(stream_id)
+        return worker.latest_frame()
+
+    def stop_stream(self, stream_id: str) -> Dict[str, object]:
+        with self._streams_lock:
+            worker = self._streams.get(stream_id)
+        if worker is None:
+            raise KeyError(stream_id)
+        return worker.stop()
+
+    def close(self) -> None:
+        with self._streams_lock:
+            workers = list(self._streams.values())
+        for worker in workers:
+            worker.stop(join_timeout=2.0)
+
+
+def create_api_server(bind_addr: str, service) -> ThreadingHTTPServer:
+    host, port = parse_api_bind(bind_addr)
+
+    class ApiHandler(BaseHTTPRequestHandler):
+        server_version = "cone-detector-v4-api/1.0"
+
+        def log_message(self, format: str, *args) -> None:
+            print(f"[API] {self.address_string()} - {format % args}")
+
+        def _send_json(self, status_code: int, payload: Dict[str, object]) -> None:
+            data = json.dumps(payload, ensure_ascii=True).encode("utf-8")
+            self.send_response(status_code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _send_bytes(self, status_code: int, data: bytes, content_type: str) -> None:
+            self.send_response(status_code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _read_body(self) -> bytes:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            return self.rfile.read(length) if length > 0 else b""
+
+        def _parse_body_and_query(self) -> Tuple[bytes, Dict[str, Any], Dict[str, List[str]]]:
+            parsed = urlparse(self.path)
+            query = parse_qs(parsed.query, keep_blank_values=True)
+            raw_body = self._read_body()
+            body: Dict[str, Any] = {}
+            content_type = self.headers.get("Content-Type", "")
+            if raw_body and content_type.startswith("application/json"):
+                body = json.loads(raw_body.decode("utf-8"))
+            return raw_body, body, query
+
+        def _handle_error(self, exc: Exception) -> None:
+            if isinstance(exc, KeyError):
+                self._send_json(404, {"ok": False, "error": f"Recurso não encontrado: {exc.args[0]}"})
+                return
+            if isinstance(exc, ValueError):
+                self._send_json(400, {"ok": False, "error": str(exc)})
+                return
+            if isinstance(exc, RuntimeError):
+                self._send_json(500, {"ok": False, "error": str(exc)})
+                return
+            self._send_json(500, {"ok": False, "error": str(exc)})
+
+        def do_GET(self) -> None:
+            parsed = urlparse(self.path)
+            parts = [p for p in parsed.path.split("/") if p]
+            try:
+                if parsed.path == "/healthz":
+                    self._send_json(200, {"ok": True})
+                    return
+                if parsed.path == "/config":
+                    payload = {"ok": True}
+                    if hasattr(service, "app_ctx"):
+                        payload.update(
+                            {
+                                "model": service.app_ctx.model_tag,
+                                "profile": service.app_ctx.overlay_ctx.profile,
+                                "runtime": {
+                                    "conf": service.app_ctx.runtime.conf,
+                                    "iou": service.app_ctx.runtime.iou,
+                                    "max_det": service.app_ctx.runtime.max_det,
+                                    "det_every": service.app_ctx.runtime.det_every,
+                                    "prefilter_enabled": service.app_ctx.runtime.prefilter_enabled,
+                                    "prefilter_min_ratio": service.app_ctx.runtime.prefilter_min_ratio,
+                                    "min_box_orange_ratio": service.app_ctx.runtime.min_box_orange_ratio,
+                                },
+                            }
+                        )
+                    self._send_json(200, payload)
+                    return
+                if len(parts) == 2 and parts[0] == "streams":
+                    self._send_json(200, service.get_stream_status(parts[1]))
+                    return
+                if len(parts) == 3 and parts[0] == "streams" and parts[2] == "frame":
+                    self._send_bytes(200, service.get_stream_frame(parts[1]), "image/jpeg")
+                    return
+                self._send_json(404, {"ok": False, "error": f"Rota não encontrada: {parsed.path}"})
+            except Exception as exc:
+                self._handle_error(exc)
+
+        def do_POST(self) -> None:
+            parsed = urlparse(self.path)
+            parts = [p for p in parsed.path.split("/") if p]
+            try:
+                raw_body, body, query = self._parse_body_and_query()
+                header_map = {k: v for k, v in self.headers.items()}
+
+                if parsed.path == "/detect/image":
+                    source = body.get("source") if body else None
+                    image_bytes = None if source else (raw_body or None)
+                    payload = service.detect_image(
+                        image_bytes=image_bytes,
+                        source=source,
+                        body=body,
+                        query=query,
+                        headers=header_map,
+                    )
+                    self._send_json(200, payload)
+                    return
+
+                if parsed.path == "/detect/video":
+                    source = body.get("source") if body else None
+                    video_bytes = None if source else (raw_body or None)
+                    payload = service.detect_video(
+                        video_bytes=video_bytes,
+                        source=source,
+                        body=body,
+                        query=query,
+                        headers=header_map,
+                    )
+                    self._send_json(200, payload)
+                    return
+
+                if parsed.path == "/streams/start":
+                    source = str(body.get("source") or "")
+                    payload = service.start_stream(source=source, body=body, query=query, headers=header_map)
+                    self._send_json(200, payload)
+                    return
+
+                if len(parts) == 3 and parts[0] == "streams" and parts[2] == "stop":
+                    self._send_json(200, service.stop_stream(parts[1]))
+                    return
+
+                self._send_json(404, {"ok": False, "error": f"Rota não encontrada: {parsed.path}"})
+            except Exception as exc:
+                self._handle_error(exc)
+
+    class ApiServer(ThreadingHTTPServer):
+        daemon_threads = True
+
+        def server_close(self) -> None:
+            if hasattr(service, "close"):
+                service.close()
+            super().server_close()
+
+    return ApiServer((host, port), ApiHandler)
 
 
 def default_output_for_source(source: Path) -> Path:
@@ -1398,22 +2270,30 @@ def default_output_for_source(source: Path) -> Path:
     return out_dir / "camera_detected.mp4"
 
 
-def main() -> None:
-    parser = build_arg_parser()
-    args = parser.parse_args()
+def build_follow_cfg(args: argparse.Namespace) -> Optional[FollowConfig]:
+    follow_enabled = bool(args.follow) or bool(args.follow_jsonl.strip())
+    if not follow_enabled:
+        return None
+    return FollowConfig(
+        camera_hfov_deg=args.camera_hfov_deg,
+        camera_fx_px=args.camera_fx_px,
+        camera_fy_px=args.camera_fy_px,
+        cone_height_m=args.cone_height_m,
+        target_distance_m=args.target_distance_m,
+        target_box_height_ratio=args.target_box_height_ratio,
+        ema_alpha=args.error_ema_alpha,
+        kp_ang=args.follow_kp_ang,
+        kd_ang=args.follow_kd_ang,
+        kp_dist=args.follow_kp_dist,
+        max_w=args.follow_max_w,
+        max_v=args.follow_max_v,
+        deadband_heading_deg=args.follow_deadband_deg,
+        deadband_dist=args.follow_deadband_dist,
+        v_slowdown_heading_deg=args.follow_v_slowdown_deg,
+    )
 
-    model_root = Path(args.model_root).expanduser().resolve()
-    catalog = ModelCatalog(model_root)
 
-    if args.list_models:
-        print("Modelos encontrados:")
-        for spec in catalog.list_models():
-            print(f"- {spec.family}/{spec.variant} -> {spec.path} | input={spec.input_w}x{spec.input_h} | output={spec.output_shape}")
-        return
-
-    runtime = resolve_runtime(args)
-    selected_model = catalog.select(runtime.family, runtime.variant)
-
+def build_app_context(args: argparse.Namespace, runtime: RuntimePreset, selected_model: ModelSpec) -> AppContext:
     detector = YoloOnnxDetector(
         model=selected_model,
         conf_thres=runtime.conf,
@@ -1423,21 +2303,9 @@ def main() -> None:
         spinning=args.enable_spinning,
         graph_opt=args.graph_opt,
     )
-    orange_filter = OrangeMaskFilter()
 
     use_roi = bool(args.roi.strip())
     roi_norm = parse_roi(args.roi) if use_roi else (0.0, 0.0, 1.0, 1.0)
-    pipeline = ConePipeline(
-        detector=detector,
-        orange_filter=orange_filter,
-        det_every=runtime.det_every,
-        prefilter_enabled=runtime.prefilter_enabled,
-        prefilter_min_ratio=runtime.prefilter_min_ratio,
-        min_box_orange_ratio=runtime.min_box_orange_ratio,
-        use_roi=use_roi,
-        roi_norm=roi_norm,
-        hold_last_on_stride=True,
-    )
     overlay_ctx = OverlayContext(
         profile=args.profile,
         runtime=runtime,
@@ -1445,29 +2313,57 @@ def main() -> None:
         roi_norm=roi_norm,
     )
 
-    follow_enabled = bool(args.follow) or bool(args.follow_jsonl.strip())
-    follow_estimator: Optional[ConeFollowErrorEstimator] = None
-    if follow_enabled:
-        follow_cfg = FollowConfig(
-            camera_hfov_deg=args.camera_hfov_deg,
-            camera_fx_px=args.camera_fx_px,
-            camera_fy_px=args.camera_fy_px,
-            cone_height_m=args.cone_height_m,
-            target_distance_m=args.target_distance_m,
-            target_box_height_ratio=args.target_box_height_ratio,
-            ema_alpha=args.error_ema_alpha,
-            kp_ang=args.follow_kp_ang,
-            kd_ang=args.follow_kd_ang,
-            kp_dist=args.follow_kp_dist,
-            max_w=args.follow_max_w,
-            max_v=args.follow_max_v,
-            deadband_heading_deg=args.follow_deadband_deg,
-            deadband_dist=args.follow_deadband_dist,
-            v_slowdown_heading_deg=args.follow_v_slowdown_deg,
-        )
-        follow_estimator = ConeFollowErrorEstimator(cfg=follow_cfg)
+    if args.api.strip():
+        if args.output.strip():
+            api_out = Path(args.output).expanduser().resolve()
+            default_output_dir = api_out if not api_out.suffix else api_out.parent
+        else:
+            default_output_dir = SCRIPT_DIR / "outputs" / "api"
+    else:
+        default_output_dir = SCRIPT_DIR / "outputs"
 
-    model_tag = selected_model.tag
+    return AppContext(
+        runtime=runtime,
+        detector=detector,
+        model_tag=selected_model.tag,
+        overlay_ctx=overlay_ctx,
+        show_orange_ratio=args.show_orange_ratio,
+        camera_width=args.camera_width,
+        camera_height=args.camera_height,
+        buffer_size=max(0, args.buffer_size),
+        drop_grabs=max(0, args.drop_grabs),
+        follow_cfg=build_follow_cfg(args),
+        default_output_dir=default_output_dir.resolve(),
+    )
+
+
+def print_runtime_info(args: argparse.Namespace, app_ctx: AppContext) -> None:
+    print(f"[INFO] Modelo: {app_ctx.model_tag}")
+    print(
+        "[INFO] Params: "
+        f"profile={args.profile}, conf={app_ctx.runtime.conf}, iou={app_ctx.runtime.iou}, "
+        f"max_det={app_ctx.runtime.max_det}, det_every={app_ctx.runtime.det_every}, "
+        f"prefilter={app_ctx.runtime.prefilter_enabled}, "
+        f"prefilter_min_ratio={app_ctx.runtime.prefilter_min_ratio}, "
+        f"min_box_orange_ratio={app_ctx.runtime.min_box_orange_ratio}, "
+        f"threads={app_ctx.runtime.threads}, graph_opt={args.graph_opt}"
+    )
+    if app_ctx.overlay_ctx.use_roi:
+        print(f"[INFO] ROI: {app_ctx.overlay_ctx.roi_norm}")
+    if app_ctx.follow_cfg is not None:
+        print(
+            "[INFO] Follow: "
+            f"hfov={args.camera_hfov_deg}, fx={args.camera_fx_px}, fy={args.camera_fy_px}, "
+            f"cone_h={args.cone_height_m}, target_dist={args.target_distance_m}, "
+            f"target_box_ratio={args.target_box_height_ratio}, "
+            f"k_ang=({args.follow_kp_ang},{args.follow_kd_ang}), "
+            f"k_dist={args.follow_kp_dist}, max_vw=({args.follow_max_v},{args.follow_max_w})"
+        )
+
+
+def run_cli_mode(args: argparse.Namespace, app_ctx: AppContext) -> None:
+    pipeline = app_ctx.create_pipeline()
+    follow_estimator = app_ctx.create_follow_estimator()
     source = args.source.strip()
     source_path = Path(source)
 
@@ -1477,27 +2373,7 @@ def main() -> None:
     else:
         output_path = default_output_for_source(source_path if source_path.exists() else Path("camera"))
 
-    print(f"[INFO] Modelo: {model_tag}")
-    print(
-        "[INFO] Params: "
-        f"profile={args.profile}, conf={runtime.conf}, iou={runtime.iou}, "
-        f"max_det={runtime.max_det}, det_every={runtime.det_every}, "
-        f"prefilter={runtime.prefilter_enabled}, "
-        f"prefilter_min_ratio={runtime.prefilter_min_ratio}, "
-        f"min_box_orange_ratio={runtime.min_box_orange_ratio}, "
-        f"threads={runtime.threads}, graph_opt={args.graph_opt}"
-    )
-    if use_roi:
-        print(f"[INFO] ROI: {roi_norm}")
-    if follow_estimator is not None:
-        print(
-            "[INFO] Follow: "
-            f"hfov={args.camera_hfov_deg}, fx={args.camera_fx_px}, fy={args.camera_fy_px}, "
-            f"cone_h={args.cone_height_m}, target_dist={args.target_distance_m}, "
-            f"target_box_ratio={args.target_box_height_ratio}, "
-            f"k_ang=({args.follow_kp_ang},{args.follow_kd_ang}), "
-            f"k_dist={args.follow_kp_dist}, max_vw=({args.follow_max_v},{args.follow_max_w})"
-        )
+    print_runtime_info(args, app_ctx)
 
     txt_lines: List[str] = []
     follow_log_file = None
@@ -1508,7 +2384,7 @@ def main() -> None:
         follow_log_file = follow_jsonl_path.open("w", encoding="utf-8")
         meta = {
             "type": "meta",
-            "model": model_tag,
+            "model": app_ctx.model_tag,
             "profile": args.profile,
             "source": args.source,
             "follow_enabled": True,
@@ -1522,10 +2398,10 @@ def main() -> None:
                 image_path=source_path,
                 out_path=out_file,
                 pipeline=pipeline,
-                model_tag=model_tag,
-                overlay_ctx=overlay_ctx,
+                model_tag=app_ctx.model_tag,
+                overlay_ctx=app_ctx.overlay_ctx,
                 show=args.show,
-                show_orange_ratio=args.show_orange_ratio,
+                show_orange_ratio=app_ctx.show_orange_ratio,
                 follow_estimator=follow_estimator,
                 follow_log_file=follow_log_file,
             )
@@ -1542,9 +2418,9 @@ def main() -> None:
                 in_dir=source_path,
                 out_dir=out_dir,
                 pipeline=pipeline,
-                model_tag=model_tag,
-                overlay_ctx=overlay_ctx,
-                show_orange_ratio=args.show_orange_ratio,
+                model_tag=app_ctx.model_tag,
+                overlay_ctx=app_ctx.overlay_ctx,
+                show_orange_ratio=app_ctx.show_orange_ratio,
                 follow_estimator=follow_estimator,
                 follow_log_file=follow_log_file,
             )
@@ -1559,26 +2435,25 @@ def main() -> None:
             out_video = output_path
             if out_video.exists() and out_video.is_dir():
                 out_video = out_video / "camera_detected.mp4"
-            logs = process_video_or_camera(
+            result = process_video_or_camera(
                 source=source,
                 out_path=out_video,
                 pipeline=pipeline,
-                model_tag=model_tag,
-                overlay_ctx=overlay_ctx,
+                model_tag=app_ctx.model_tag,
+                overlay_ctx=app_ctx.overlay_ctx,
                 show=args.show,
-                show_orange_ratio=args.show_orange_ratio,
-                camera_width=args.camera_width,
-                camera_height=args.camera_height,
-                buffer_size=max(0, args.buffer_size),
-                drop_grabs=max(0, args.drop_grabs),
+                show_orange_ratio=app_ctx.show_orange_ratio,
+                camera_width=app_ctx.camera_width,
+                camera_height=app_ctx.camera_height,
+                buffer_size=app_ctx.buffer_size,
+                drop_grabs=app_ctx.drop_grabs,
                 follow_estimator=follow_estimator,
                 follow_log_file=follow_log_file,
             )
-            for line in logs:
+            for line in result.logs:
                 print(f"[INFO] {line}")
-            if out_video:
-                print(f"[OK] Vídeo salvo em: {out_video}")
-            txt_lines.extend(logs)
+            print(f"[OK] Vídeo salvo em: {out_video}")
+            txt_lines.extend(result.logs)
     finally:
         if follow_log_file is not None:
             follow_log_file.close()
@@ -1595,6 +2470,48 @@ def main() -> None:
         txt_path = Path(args.save_txt).expanduser().resolve()
         write_txt_log(txt_path, txt_lines)
         print(f"[OK] Log TXT salvo em: {txt_path}")
+
+
+def run_api_mode(args: argparse.Namespace, app_ctx: AppContext) -> None:
+    print_runtime_info(args, app_ctx)
+    service = ConeApiService(app_ctx)
+    server = create_api_server(args.api.strip(), service)
+    host, port = server.server_address[:2]
+    print(f"[INFO] API escutando em http://{host}:{port}")
+    print("[INFO] Endpoints: GET /healthz, POST /detect/image, POST /detect/video, POST /streams/start")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("[INFO] Encerrando API...")
+    finally:
+        server.server_close()
+
+
+def main() -> None:
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
+    model_root = Path(args.model_root).expanduser().resolve()
+    catalog = ModelCatalog(model_root)
+
+    if args.list_models:
+        print("Modelos encontrados:")
+        for spec in catalog.list_models():
+            print(f"- {spec.family}/{spec.variant} -> {spec.path} | input={spec.input_w}x{spec.input_h} | output={spec.output_shape}")
+        return
+
+    if not args.api.strip() and not args.source.strip():
+        parser.error("--source é obrigatório quando --api não é usado.")
+
+    runtime = resolve_runtime(args)
+    selected_model = catalog.select(runtime.family, runtime.variant)
+    app_ctx = build_app_context(args=args, runtime=runtime, selected_model=selected_model)
+
+    if args.api.strip():
+        run_api_mode(args, app_ctx)
+        return
+
+    run_cli_mode(args, app_ctx)
 
 
 if __name__ == "__main__":

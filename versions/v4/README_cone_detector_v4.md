@@ -57,6 +57,56 @@ python3 v4/cone_detector_v4.py \
   --profile fast
 ```
 
+## Modo API HTTP
+
+Suba o detector como serviço:
+
+```bash
+python3 v4/cone_detector_v4.py --api localhost:9820 --profile balanced
+```
+
+Endpoints principais:
+
+- `GET /healthz`: health check.
+- `POST /detect/image`: recebe imagem por JSON (`{"source":".../img.png","return_image":false,"output":"/tmp/out.png"}`) ou bytes brutos (`Content-Type: image/jpeg`).
+- `POST /detect/video`: recebe vídeo por JSON (`{"source":".../video.mp4","output":"/tmp/out.mp4"}`) ou bytes brutos.
+- `POST /streams/start`: inicia processamento contínuo de câmera/RTSP/arquivo (`{"source":"0","max_frames":300}`).
+- `GET /streams/<id>`: status e últimas detecções.
+- `GET /streams/<id>/frame`: último frame renderizado em `image/jpeg`.
+- `POST /streams/<id>/stop`: encerra o stream.
+
+Exemplo com imagem por path:
+
+```bash
+curl -X POST http://localhost:9820/detect/image \
+  -H 'Content-Type: application/json' \
+  -d '{"source":"v4/dataset/0_image1.png","return_image":false}'
+```
+
+Se o cliente estiver em outro diretório e quiser usar caminho relativo local, envie também `cwd`/`client_cwd`:
+
+```bash
+curl -X POST http://localhost:9820/detect/image \
+  -H 'Content-Type: application/json' \
+  -d "{\"source\":\"0_image1.png\",\"cwd\":\"$(pwd)\",\"return_image\":false}"
+```
+
+Exemplo salvando a imagem renderizada em disco:
+
+```bash
+curl -X POST http://localhost:9820/detect/image \
+  -H 'Content-Type: application/json' \
+  -d "{\"source\":\"0_image1.png\",\"cwd\":\"$(pwd)\",\"return_image\":false,\"output\":\"$(pwd)/saida_detectada.png\"}"
+```
+
+Se `output` vier sem extensão, use `output_format`:
+
+```bash
+curl -X POST http://localhost:9820/detect/image \
+  -H 'Content-Type: application/json' \
+  -d "{\"source\":\"0_image1.png\",\"cwd\":\"$(pwd)\",\"return_image\":false,\"output\":\"$(pwd)/renders/resultado\",\"output_format\":\"png\"}"
+```
+
 ## GUI e front-end (planejamento)
 
 - Plano de GUI: `v4/GUI_PLAN.md`
